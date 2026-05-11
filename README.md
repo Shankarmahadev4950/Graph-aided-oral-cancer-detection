@@ -109,6 +109,14 @@ The combination of the GAT, Max-Pooling, and Focal Loss was incredibly effective
 
 Because neural networks output raw probabilities, the default 0.50 cutoff is rarely optimal for imbalanced medical data. So, I wrote an automated evaluation script that dynamically sweeps across probability thresholds to find the mathematical sweet spot that maximizes Accuracy and F1 Score on the unseen test set. 
 
+<img width="4170" height="1849" alt="roc_pr_curves (1)" src="https://github.com/user-attachments/assets/d5fa841d-8416-49ed-a7b9-956b0cba675e" />
+
+<img width="747" height="305" alt="Screenshot 2026-05-04 170451" src="https://github.com/user-attachments/assets/6b379095-68a9-4cfb-af34-6699d2036921" />
+
+
+
+
+
 ##  Tech Stack
 * **PyTorch & PyTorch Geometric (PyG)** for the deep learning and graph architecture.
 * **Scikit-Image & OpenCV** for stain normalization and spatial manipulations.
