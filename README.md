@@ -1,4 +1,4 @@
-# Graph-aided-oral-cancer-detection
+[architecture.md](https://github.com/user-attachments/files/27593721/architecture.md)# Graph-aided-oral-cancer-detection
 Graph-based Deep Learning framework for Oral Squamous Cell Carcinoma (OSCC) detection from histopathology images.
 This project is a deep learning pipeline I built to classify **Oral Squamous Cell Carcinoma (OSCC)** from histopathology images. 
 
@@ -7,6 +7,76 @@ If you've ever worked with medical imaging—specifically Whole Slide Images (WS
 To solve this, I decided to treat the tissue not just as a grid of pixels, but as a **Graph**. 
 
 ## My Architecture & Pipeline
+[Uploading# OSCC Graph Neural Network Architecture
+
+You can add this Mermaid diagram directly to your GitHub `README.md`. GitHub supports Mermaid natively, so if you copy and paste the block below into your markdown file, it will automatically render into a beautiful flowchart!
+
+```mermaid
+graph TD
+    %% Styling
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px,color:#000
+    classDef process fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef model fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#000
+    classDef graph_layer fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    classDef output fill:#ffebee,stroke:#d32f2f,stroke-width:2px,color:#000
+    classDef loss fill:#eceff1,stroke:#455a64,stroke-width:2px,color:#000
+
+    %% Input Phase
+    A["Raw Histopathology Image (H&E Stained)"]:::input --> B["Phase 0: Preprocessing"]:::process
+    
+    %% Preprocessing Phase
+    subgraph Preprocessing
+        B --> C["Macenko Stain Normalization"]:::process
+        C --> D["Tiling & Background Removal"]:::process
+        D --> E["N Valid Tissue Patches (256x256)"]:::input
+    end
+
+    %% CNN Backbone Phase
+    E --> F["Phase 1: Feature Extraction"]:::model
+    subgraph CNN_Backbone [ResNet-50 Feature Extractor]
+        F --> G["Pre-trained ResNet-50 (Frozen)"]:::model
+        G --> H["Global Average Pooling"]:::model
+        H --> I["2048-Dimensional Feature Vector per Patch"]:::input
+    end
+
+    %% Graph Construction Phase
+    I --> J["Phase 2: Graph Construction"]:::process
+    subgraph Spatial_Graph [PyTorch Geometric Graph]
+        J --> K["Nodes = Patches (2048-D)"]:::graph_layer
+        J --> L["Edges = Spatial & KNN Connectivity"]:::graph_layer
+        K --> M["Unified Graph per Slide"]:::graph_layer
+        L --> M
+    end
+
+    %% GNN Phase
+    M --> N["Phase 3: Graph Attention Network (GAT)"]:::model
+    subgraph GNN_Architecture [Graph Neural Network]
+        N --> O["GATConv Layer 1 (64 dim, 4 heads)"]:::graph_layer
+        O --> P["DropEdge (20%) & BatchNorm"]:::graph_layer
+        P --> Q["GATConv Layer 2 & 3"]:::graph_layer
+        
+        %% MIL Pooling
+        Q --> R["Multiple Instance Learning (MIL) Pooling"]:::process
+        R --> S["Global Mean Pool (Tissue Context)"]:::process
+        R --> T["Global Max Pool (Tumor Focal Points)"]:::process
+        S --> U["Concatenated Graph Embedding"]:::model
+        T --> U
+    end
+
+    %% Classification Phase
+    U --> V["Phase 4: Classification & Training"]:::model
+    subgraph Classification [Classifier & Loss]
+        V --> W["Linear Layer + Dropout (0.4)"]:::model
+        W --> X["Output Logits"]:::output
+        
+        %% Imbalance handling
+        Y["WeightedRandomSampler (50/50 Batches)"]:::loss -.-> X
+        Z["Focal Loss (Gamma=3.0)"]:::loss -.-> X
+    end
+
+    X --> FINAL["Final Prediction: Normal vs OSCC"]:::output
+```
+ architecture.md…]()
 
 I broke this project down into a highly modular, four-phase pipeline to make experimentation (and caching) fast and efficient:
 
@@ -16,7 +86,7 @@ First, H&E stained slides can look drastically different depending on the lab th
 ### 2. Feature Extraction (CNN Backbone)
 Instead of training a massive network from scratch, I used a pre-trained **ResNet-50** as a frozen feature extractor. Every single patch is passed through the ResNet backbone, generating a dense 2048-dimensional feature vector. To save hours of computing time, I cached these features locally using `pickle`.
 
-### 3. Graph Construction (The "Aha!" Moment)
+### 3. Graph Construction 
 Here is where the magic happens. I built a `GraphConstructor` that turns the extracted patches into a PyTorch Geometric Graph:
 * **Nodes:** Each patch is a node, holding the 2048-D feature vector.
 * **Edges:** I used a hybrid connectivity approach (combining physical grid adjacency with K-Nearest Neighbors). This allows the network to "see" the tissue architecture just like a pathologist scanning a slide.
