@@ -9,7 +9,6 @@ To solve this, I decided to treat the tissue not just as a grid of pixels, but a
 ## My Architecture & Pipeline
 [Uploading# OSCC Graph Neural Network Architecture
 
-You can add this Mermaid diagram directly to your GitHub `README.md`. GitHub supports Mermaid natively, so if you copy and paste the block below into your markdown file, it will automatically render into a beautiful flowchart!
 
 ```mermaid
 graph TD
