@@ -1,0 +1,1983 @@
+"""
+Phase 0: Foundational Setup & Data Curation
+============================================
+
+This module provides foundational setup for reproducible OSCC classification pipeline
+including environment setup, data preprocessing, stain normalization, and tiling strategy.
+"""
+
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import cv2
+from skimage import io, color, exposure
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+def set_random_seeds(seed=42):
+    """
+    Set random seeds for reproducibility across all libraries
+    
+    Args:
+        seed (int): Random seed value
+    """
+    # Set Python random seed
+    random.seed(seed)
+    
+    # Set NumPy random seed
+    np.random.seed(seed)
+    
+    # Set PyTorch random seeds
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # Set deterministic behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Set environment variable for hash seed
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    print(f"Random seeds set to {seed} for reproducibility")
+
+
+def macenko_stain_normalization(image, target_stain_matrix=None, target_concentrations=None):
+    """
+    Implement Macenko stain normalization for H&E stained histopathology images
+    
+    Args:
+        image (np.array): Input RGB image (H, W, 3)
+        target_stain_matrix (np.array): Target stain matrix (2, 3) [H, E stains]
+        target_concentrations (np.array): Target stain concentrations (2,)
+    
+    Returns:
+        np.array: Normalized image
+    """
+    # Default H&E stain matrix and concentrations from literature
+    if target_stain_matrix is None:
+        target_stain_matrix = np.array([[0.65, 0.70, 0.29],  # Hematoxylin
+                                       [0.07, 0.99, 0.11]])  # Eosin
+    
+    if target_concentrations is None:
+        target_concentrations = np.array([1.9705, 1.0308])
+    
+    # Convert RGB to optical density (OD)
+    image_norm = image.astype(np.float64) / 255.0
+    image_norm = np.maximum(image_norm, 1e-6)  # Avoid log(0)
+    od_image = -np.log10(image_norm)
+    
+    # Remove background pixels (low OD)
+    od_threshold = 0.15
+    od_mask = np.sum(od_image, axis=2) > od_threshold
+    od_pixels = od_image[od_mask]
+    
+    if len(od_pixels) == 0:
+        return image  # Return original if no foreground pixels
+    
+    # Singular Value Decomposition
+    try:
+        U, s, Vt = np.linalg.svd(od_pixels.T, full_matrices=False)
+        
+        # Create plane from first 2 singular vectors
+        if len(s) >= 2:
+            plane = U[:, :2]
+            
+            # Project OD pixels onto the plane
+            projected = np.dot(od_pixels, plane)
+            
+            # Normalize to unit length
+            projected_norm = projected / np.linalg.norm(projected, axis=1, keepdims=True)
+            
+            # Find angles with respect to first direction
+            angles = np.arctan2(projected_norm[:, 1], projected_norm[:, 0])
+            
+            # Find robust extremes (1st and 99th percentiles)
+            min_angle = np.percentile(angles, 1)
+            max_angle = np.percentile(angles, 99)
+            
+            # Convert back to OD space
+            extreme_angles = np.array([min_angle, max_angle])
+            stain_vectors = np.array([
+                [np.cos(extreme_angles[0]), np.sin(extreme_angles[0])],
+                [np.cos(extreme_angles[1]), np.sin(extreme_angles[1])]
+            ])
+            
+            # Convert to original space
+            stain_matrix = np.dot(stain_vectors, plane.T)
+            
+            # Ensure stain directions are correct (H should be more blue, E more pink)
+            if stain_matrix[0, 2] > stain_matrix[1, 2]:
+                stain_matrix = stain_matrix[[1, 0], :]
+            
+            # Calculate concentrations
+            concentrations = np.linalg.lstsq(stain_matrix.T, od_pixels.T, rcond=None)[0]
+            
+            # Find robust maxima (99th percentile)
+            max_concentrations = np.percentile(concentrations, 99, axis=1)
+            
+            # Normalize concentrations
+            concentrations_normalized = concentrations * (target_concentrations[:, np.newaxis] / max_concentrations[:, np.newaxis])
+            
+            # Reconstruct normalized image
+            od_normalized = np.dot(target_stain_matrix.T, concentrations_normalized)
+            
+            # Convert back to RGB
+            image_normalized = 10**(-od_normalized.T)
+            image_normalized = np.clip(image_normalized * 255, 0, 255).astype(np.uint8)
+            
+            # Reconstruct full image
+            result = np.copy(image)
+            result[od_mask] = image_normalized
+            
+            return result
+            
+    except np.linalg.LinAlgError:
+        print("SVD failed, returning original image")
+        return image
+    
+    return image
+
+
+def tile_image(image, patch_size=256, overlap=0, min_foreground_ratio=0.1):
+    """
+    Tile a large histopathology image into smaller patches
+    
+    Args:
+        image (np.array): Input image (H, W, C)
+        patch_size (int): Size of square patches
+        overlap (float): Overlap ratio between patches (0-1)
+        min_foreground_ratio (float): Minimum foreground ratio to keep patch
+    
+    Returns:
+        list: List of patches with their coordinates
+        list: List of coordinates (row, col) for each patch
+    """
+    h, w = image.shape[:2]
+    stride = int(patch_size * (1 - overlap))
+    
+    patches = []
+    coordinates = []
+    
+    for row in range(0, h - patch_size + 1, stride):
+        for col in range(0, w - patch_size + 1, stride):
+            patch = image[row:row + patch_size, col:col + patch_size]
+            
+            # Calculate foreground ratio (non-white pixels)
+            if len(patch.shape) == 3:
+                gray_patch = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+            else:
+                gray_patch = patch
+            
+            foreground_ratio = np.sum(gray_patch < 240) / (patch_size * patch_size)
+            
+            if foreground_ratio >= min_foreground_ratio:
+                patches.append(patch)
+                coordinates.append((row, col))
+    
+    return patches, coordinates
+
+
+class OSCCDataset(Dataset):
+    """
+    Dataset class for OSCC histopathology images with preprocessing
+    """
+    
+    def __init__(self, image_paths, labels, patch_size=256, apply_normalization=True, 
+                 transform=None, min_foreground_ratio=0.1):
+        """
+        Args:
+            image_paths (list): List of paths to histopathology images
+            labels (list): List of labels (0: Normal, 1: OSCC)
+            patch_size (int): Size of patches to extract
+            apply_normalization (bool): Whether to apply Macenko normalization
+            transform: Additional transforms to apply
+            min_foreground_ratio (float): Minimum foreground content
+        """
+        self.image_paths = image_paths
+        self.labels = labels
+        self.patch_size = patch_size
+        self.apply_normalization = apply_normalization
+        self.transform = transform
+        self.min_foreground_ratio = min_foreground_ratio
+        
+        # Process all images and extract patches
+        self.patches = []
+        self.patch_labels = []
+        self.patch_metadata = []
+        
+        self._extract_all_patches()
+    
+    def _extract_all_patches(self):
+        """Extract patches from all images during initialization"""
+        print("Extracting patches from all images...")
+        
+        for idx, (image_path, label) in enumerate(tqdm(zip(self.image_paths, self.labels))):
+            image = io.imread(image_path)
+            
+            # Apply stain normalization if requested
+            if self.apply_normalization:
+                image = macenko_stain_normalization(image)
+            
+            # Extract patches
+            patches, coordinates = tile_image(
+                image, 
+                patch_size=self.patch_size,
+                min_foreground_ratio=self.min_foreground_ratio
+            )
+            
+            # Store patches with metadata
+            for patch, coord in zip(patches, coordinates):
+                self.patches.append(patch)
+                self.patch_labels.append(label)
+                self.patch_metadata.append({
+                    'image_id': idx,
+                    'image_path': image_path,
+                    'coordinates': coord
+                })
+        
+        print(f"Extracted {len(self.patches)} patches from {len(self.image_paths)} images")
+    
+    def __len__(self):
+        return len(self.patches)
+    
+    def __getitem__(self, idx):
+        patch = self.patches[idx]
+        label = self.patch_labels[idx]
+        metadata = self.patch_metadata[idx]
+        
+        # Apply transforms if provided
+        if self.transform:
+            patch = self.transform(patch)
+        
+        return patch, label, metadata
+
+
+def save_patches_to_directory(dataset, output_dir):
+    """
+    Save extracted patches to a structured directory
+    
+    Args:
+        dataset (OSCCDataset): Dataset containing patches
+        output_dir (str): Output directory path
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create subdirectories for each class
+    normal_dir = output_dir / "Normal"
+    oscc_dir = output_dir / "OSCC"
+    normal_dir.mkdir(exist_ok=True)
+    oscc_dir.mkdir(exist_ok=True)
+    
+    print(f"Saving patches to {output_dir}")
+    
+    for idx in tqdm(range(len(dataset))):
+        patch, label, metadata = dataset[idx]
+        
+        # Determine subdirectory
+        subdir = normal_dir if label == 0 else oscc_dir
+        class_name = "Normal" if label == 0 else "OSCC"
+        
+        # Create filename with metadata
+        image_id = metadata['image_id']
+        row, col = metadata['coordinates']
+        filename = f"{class_name}_img{image_id:04d}_r{row}_c{col}.png"
+        
+        # Save patch
+        filepath = subdir / filename
+        io.imsave(filepath, patch)
+
+
+def create_data_splits(image_paths, labels, test_size=0.2, val_size=0.2, random_state=42):
+    """
+    Create train/validation/test splits with stratification
+    
+    Args:
+        image_paths (list): List of image paths
+        labels (list): List of labels
+        test_size (float): Proportion of test set
+        val_size (float): Proportion of validation set (from remaining data)
+        random_state (int): Random state for reproducibility
+    
+    Returns:
+        tuple: (train_paths, val_paths, test_paths, train_labels, val_labels, test_labels)
+    """
+    # First split: separate test set
+    train_val_paths, test_paths, train_val_labels, test_labels = train_test_split(
+        image_paths, labels, test_size=test_size, random_state=random_state, 
+        stratify=labels
+    )
+    
+    # Second split: separate train and validation
+    train_paths, val_paths, train_labels, val_labels = train_test_split(
+        train_val_paths, train_val_labels, test_size=val_size, 
+        random_state=random_state, stratify=train_val_labels
+    )
+    
+    print(f"Data splits created:")
+    print(f"  Training: {len(train_paths)} images")
+    print(f"  Validation: {len(val_paths)} images") 
+    print(f"  Test: {len(test_paths)} images")
+    
+    return train_paths, val_paths, test_paths, train_labels, val_labels, test_labels
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    set_random_seeds(42)
+    
+    # Example of how to use the preprocessing pipeline
+    print("Phase 0 setup complete!")
+    print("Key components implemented:")
+    print("1. ✓ Random seed setting for reproducibility")
+    print("2. ✓ Macenko stain normalization")
+    print("3. ✓ Image tiling with foreground detection")
+    print("4. ✓ OSCC dataset class with preprocessing")
+    print("5. ✓ Data splitting with stratification")
+
+"""
+Phase 1: Patch-Level Feature Extraction (CNN Backbone)
+======================================================
+
+This module implements CNN backbone for extracting patch-level features using ResNet-50
+with both frozen feature extraction and fine-tuning strategies.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models, transforms
+from torch.utils.data import DataLoader
+import numpy as np
+from tqdm import tqdm
+import os
+from pathlib import Path
+import pickle
+
+
+class ResNetFeatureExtractor(nn.Module):
+    """
+    ResNet-50 based feature extractor for histopathology patches
+    """
+    
+    def __init__(self, pretrained=True, frozen=True, feature_dim=2048):
+        """
+        Args:
+            pretrained (bool): Use ImageNet pretrained weights
+            frozen (bool): Freeze backbone weights for feature extraction
+            feature_dim (int): Dimension of output features
+        """
+        super(ResNetFeatureExtractor, self).__init__()
+        
+        # Load pretrained ResNet-50
+        self.backbone = models.resnet50(pretrained=pretrained)
+        
+        # Remove final classification layer
+        self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
+        
+        self.frozen = frozen
+        self.feature_dim = feature_dim
+        
+        if frozen:
+            # Freeze all parameters for feature extraction
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            self.backbone.eval()
+            print("ResNet-50 backbone frozen for feature extraction")
+        else:
+            print("ResNet-50 backbone unfrozen for fine-tuning")
+        
+        # Add global average pooling to ensure consistent output size
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+    def forward(self, x):
+        """
+        Forward pass through backbone
+        
+        Args:
+            x (torch.Tensor): Input images (B, C, H, W)
+            
+        Returns:
+            torch.Tensor: Feature vectors (B, feature_dim)
+        """
+        if self.frozen:
+            with torch.no_grad():
+                features = self.backbone(x)
+        else:
+            features = self.backbone(x)
+        
+        # Global average pooling and flatten
+        features = self.global_pool(features)
+        features = features.view(features.size(0), -1)
+        
+        return features
+
+
+class ResNetFineTuner(nn.Module):
+    """
+    ResNet-50 with classification head for fine-tuning on OSCC patches
+    """
+    
+    def __init__(self, pretrained=True, num_classes=2, dropout_rate=0.5):
+        """
+        Args:
+            pretrained (bool): Use ImageNet pretrained weights
+            num_classes (int): Number of output classes
+            dropout_rate (float): Dropout rate for classification head
+        """
+        super(ResNetFineTuner, self).__init__()
+        
+        # Load pretrained ResNet-50
+        self.backbone = models.resnet50(pretrained=pretrained)
+        
+        # Get feature dimension from last layer
+        feature_dim = self.backbone.fc.in_features
+        
+        # Replace final layer with custom classification head
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, num_classes)
+        )
+        
+        print(f"ResNet-50 fine-tuner initialized with {num_classes} classes")
+    
+    def forward(self, x):
+        """
+        Forward pass through full network
+        
+        Args:
+            x (torch.Tensor): Input images (B, C, H, W)
+            
+        Returns:
+            torch.Tensor: Class logits (B, num_classes)
+        """
+        return self.backbone(x)
+    
+    def extract_features(self, x):
+        """
+        Extract features from penultimate layer
+        
+        Args:
+            x (torch.Tensor): Input images (B, C, H, W)
+            
+        Returns:
+            torch.Tensor: Feature vectors (B, feature_dim)
+        """
+        # Forward through all layers except final classification
+        features = nn.Sequential(*list(self.backbone.children())[:-1])(x)
+        features = F.adaptive_avg_pool2d(features, (1, 1))
+        features = features.view(features.size(0), -1)
+        return features
+
+
+def get_patch_transforms(image_size=224, is_training=True):
+    """
+    Get appropriate transforms for patch preprocessing
+    
+    Args:
+        image_size (int): Target image size
+        is_training (bool): Whether for training (includes augmentation)
+        
+    Returns:
+        torchvision.transforms.Compose: Transform pipeline
+    """
+    if is_training:
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=90),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+    
+    return transform
+
+
+def extract_features_from_patches(model, dataloader, device, save_path=None):
+    """
+    Extract features from patches using trained/pretrained model
+    
+    Args:
+        model (nn.Module): Feature extraction model
+        dataloader (DataLoader): DataLoader with patches
+        device (torch.device): Device to run inference on
+        save_path (str): Path to save extracted features
+        
+    Returns:
+        dict: Dictionary containing features, labels, and metadata
+    """
+    model.eval()
+    model.to(device)
+    
+    all_features = []
+    all_labels = []
+    all_metadata = []
+    
+    print("Extracting features from patches...")
+    
+    with torch.no_grad():
+        for batch_idx, (patches, labels, metadata) in enumerate(tqdm(dataloader)):
+            patches = patches.to(device)
+            
+            # Extract features
+            if hasattr(model, 'extract_features'):
+                features = model.extract_features(patches)
+            else:
+                features = model(patches)
+            
+            # Move to CPU and convert to numpy
+            features = features.cpu().numpy()
+            labels = labels.numpy()
+            
+            all_features.append(features)
+            all_labels.extend(labels)
+            all_metadata.extend(metadata)
+    
+    # Concatenate all features
+    all_features = np.concatenate(all_features, axis=0)
+    all_labels = np.array(all_labels)
+    
+    feature_data = {
+        'features': all_features,
+        'labels': all_labels,
+        'metadata': all_metadata
+    }
+    
+    print(f"Extracted {all_features.shape[0]} feature vectors of dimension {all_features.shape[1]}")
+    
+    # Save features if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'wb') as f:
+            pickle.dump(feature_data, f)
+        print(f"Features saved to {save_path}")
+    
+    return feature_data
+
+
+def train_resnet_classifier(model, train_loader, val_loader, device, num_epochs=50, 
+                           learning_rate=1e-4, weight_decay=1e-4, save_path=None):
+    """
+    Train ResNet classifier on OSCC patches
+    
+    Args:
+        model (nn.Module): ResNet model to train
+        train_loader (DataLoader): Training data loader
+        val_loader (DataLoader): Validation data loader
+        device (torch.device): Device for training
+        num_epochs (int): Number of training epochs
+        learning_rate (float): Initial learning rate
+        weight_decay (float): Weight decay for regularization
+        save_path (str): Path to save best model
+        
+    Returns:
+        dict: Training history
+    """
+    model.to(device)
+    
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
+    # Training history
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': []
+    }
+    
+    best_val_acc = 0.0
+    best_model_state = None
+    
+    print(f"Training ResNet classifier for {num_epochs} epochs...")
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for patches, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
+            patches, labels = patches.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(patches)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
+        
+        train_loss = train_loss / len(train_loader)
+        train_acc = 100. * train_correct / train_total
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for patches, labels, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                patches, labels = patches.to(device), labels.to(device)
+                
+                outputs = model(patches)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+        
+        val_loss = val_loss / len(val_loader)
+        val_acc = 100. * val_correct / val_total
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Save history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = model.state_dict().copy()
+        
+        print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
+              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"Best validation accuracy: {best_val_acc:.2f}%")
+    
+    # Save model if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'history': history,
+            'best_val_acc': best_val_acc
+        }, save_path)
+        print(f"Best model saved to {save_path}")
+    
+    return history
+
+
+class PatchDataset(torch.utils.data.Dataset):
+    """
+    Simple dataset wrapper for patch data with transforms
+    """
+    
+    def __init__(self, patches, labels, metadata, transform=None):
+        self.patches = patches
+        self.labels = labels
+        self.metadata = metadata
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.patches)
+    
+    def __getitem__(self, idx):
+        patch = self.patches[idx]
+        label = self.labels[idx]
+        meta = self.metadata[idx] if self.metadata else {}
+        
+        if self.transform:
+            patch = self.transform(patch)
+        
+        return patch, label, meta
+
+
+# Example usage and comparison
+def compare_feature_extraction_strategies():
+    """
+    Compare frozen vs fine-tuned feature extraction strategies
+    """
+    print("\n" + "="*60)
+    print("FEATURE EXTRACTION STRATEGY COMPARISON")
+    print("="*60)
+    
+    print("\n1. FROZEN FEATURE EXTRACTOR:")
+    print("   ✓ Advantages:")
+    print("     - Computationally efficient")
+    print("     - Fast inference")
+    print("     - No need for patch-level labels") 
+    print("     - Proven ImageNet features")
+    print("   ✗ Disadvantages:")
+    print("     - May not capture domain-specific features")
+    print("     - Fixed representation")
+    
+    print("\n2. FINE-TUNED FEATURE EXTRACTOR:")
+    print("   ✓ Advantages:")
+    print("     - Domain-adapted features")
+    print("     - Better performance potential")
+    print("     - Task-specific representations")
+    print("   ✗ Disadvantages:")
+    print("     - Computationally expensive")
+    print("     - Requires patch-level labels")
+    print("     - Risk of overfitting")
+    
+    print("\n3. RECOMMENDED APPROACH:")
+    print("   → Start with frozen extraction for baseline")
+    print("   → Fine-tune if computational resources allow")
+    print("   → Compare both strategies empirically")
+
+
+if __name__ == "__main__":
+    print("Phase 1: CNN Backbone implemented successfully!")
+    print("\nKey components:")
+    print("1. ✓ ResNet-50 feature extractor (frozen)")
+    print("2. ✓ ResNet-50 fine-tuner with classification head") 
+    print("3. ✓ Patch preprocessing transforms")
+    print("4. ✓ Feature extraction pipeline")
+    print("5. ✓ Training pipeline for fine-tuning")
+    
+    # Show strategy comparison
+    compare_feature_extraction_strategies()
+
+"""
+Phase 2: Graph Construction & Data Assembly
+===========================================
+
+This module implements graph construction from patch features and spatial relationships,
+creating PyTorch Geometric Data objects for GNN training.
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.utils import to_undirected
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+import pickle
+from tqdm import tqdm
+from pathlib import Path
+import matplotlib.pyplot as plt
+import networkx as nx
+
+
+class GraphConstructor:
+    """
+    Class for constructing graphs from histopathology image patches
+    """
+    
+    def __init__(self, patch_size=256, connectivity='grid', k_neighbors=8, 
+                 distance_threshold=None, add_self_loops=True):
+        """
+        Args:
+            patch_size (int): Size of patches used for tiling
+            connectivity (str): Type of connectivity ('grid', 'knn', 'radius', 'hybrid')
+            k_neighbors (int): Number of nearest neighbors for KNN connectivity
+            distance_threshold (float): Distance threshold for radius connectivity
+            add_self_loops (bool): Whether to add self loops to the graph
+        """
+        self.patch_size = patch_size
+        self.connectivity = connectivity
+        self.k_neighbors = k_neighbors
+        self.distance_threshold = distance_threshold
+        self.add_self_loops = add_self_loops
+        
+    def construct_spatial_graph(self, coordinates, image_shape=None):
+        """
+        Construct spatial adjacency graph based on patch coordinates
+        
+        Args:
+            coordinates (list): List of (row, col) coordinates for each patch
+            image_shape (tuple): Original image shape (height, width)
+            
+        Returns:
+            torch.Tensor: Edge index tensor of shape (2, num_edges)
+        """
+        coordinates = np.array(coordinates)
+        num_patches = len(coordinates)
+        
+        if self.connectivity == 'grid':
+            return self._construct_grid_graph(coordinates)
+        elif self.connectivity == 'knn':
+            return self._construct_knn_graph(coordinates)
+        elif self.connectivity == 'radius':
+            return self._construct_radius_graph(coordinates)
+        elif self.connectivity == 'hybrid':
+            return self._construct_hybrid_graph(coordinates)
+        else:
+            raise ValueError(f"Unknown connectivity type: {self.connectivity}")
+    
+    def _construct_grid_graph(self, coordinates):
+        """
+        Construct graph based on spatial grid adjacency
+        """
+        edge_list = []
+        coord_to_idx = {tuple(coord): idx for idx, coord in enumerate(coordinates)}
+        
+        for idx, (row, col) in enumerate(coordinates):
+            # Check 8-connected neighborhood (including diagonals)
+            neighbors = [
+                (row - self.patch_size, col),                    # Up
+                (row + self.patch_size, col),                    # Down  
+                (row, col - self.patch_size),                    # Left
+                (row, col + self.patch_size),                    # Right
+                (row - self.patch_size, col - self.patch_size),  # Up-Left
+                (row - self.patch_size, col + self.patch_size),  # Up-Right
+                (row + self.patch_size, col - self.patch_size),  # Down-Left
+                (row + self.patch_size, col + self.patch_size),  # Down-Right
+            ]
+            
+            for neighbor_coord in neighbors:
+                if tuple(neighbor_coord) in coord_to_idx:
+                    neighbor_idx = coord_to_idx[tuple(neighbor_coord)]
+                    edge_list.append([idx, neighbor_idx])
+        
+        if len(edge_list) == 0:
+            # No connections found, create empty edge index
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+        else:
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+            edge_index = to_undirected(edge_index)
+        
+        if self.add_self_loops:
+            # Add self loops
+            num_nodes = len(coordinates)
+            self_loops = torch.arange(num_nodes).unsqueeze(0).repeat(2, 1)
+            edge_index = torch.cat([edge_index, self_loops], dim=1)
+        
+        return edge_index
+    
+    def _construct_knn_graph(self, coordinates):
+        """
+        Construct K-nearest neighbors graph
+        """
+        if len(coordinates) <= self.k_neighbors:
+            # If we have fewer patches than k_neighbors, connect all to all
+            k = len(coordinates) - 1
+        else:
+            k = self.k_neighbors
+        
+        if k <= 0:
+            # Single patch case
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+        else:
+            nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='ball_tree').fit(coordinates)
+            distances, indices = nbrs.kneighbors(coordinates)
+            
+            edge_list = []
+            for i, neighbors in enumerate(indices):
+                for neighbor in neighbors[1:]:  # Skip self (first element)
+                    edge_list.append([i, neighbor])
+            
+            if len(edge_list) == 0:
+                edge_index = torch.zeros((2, 0), dtype=torch.long)
+            else:
+                edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+                edge_index = to_undirected(edge_index)
+        
+        if self.add_self_loops:
+            num_nodes = len(coordinates)
+            self_loops = torch.arange(num_nodes).unsqueeze(0).repeat(2, 1)
+            edge_index = torch.cat([edge_index, self_loops], dim=1)
+        
+        return edge_index
+    
+    def _construct_radius_graph(self, coordinates):
+        """
+        Construct radius-based graph
+        """
+        if self.distance_threshold is None:
+            # Default to 1.5 times patch size
+            self.distance_threshold = 1.5 * self.patch_size
+        
+        distances = np.linalg.norm(coordinates[:, np.newaxis] - coordinates[np.newaxis, :], axis=2)
+        
+        edge_list = []
+        for i in range(len(coordinates)):
+            for j in range(i+1, len(coordinates)):
+                if distances[i, j] <= self.distance_threshold:
+                    edge_list.append([i, j])
+                    edge_list.append([j, i])  # Add reverse edge
+        
+        if len(edge_list) == 0:
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+        else:
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+        
+        if self.add_self_loops:
+            num_nodes = len(coordinates)
+            self_loops = torch.arange(num_nodes).unsqueeze(0).repeat(2, 1)
+            edge_index = torch.cat([edge_index, self_loops], dim=1)
+        
+        return edge_index
+    
+    def _construct_hybrid_graph(self, coordinates):
+        """
+        Construct hybrid graph combining spatial and feature-based connectivity
+        """
+        # Start with grid-based connectivity
+        spatial_edges = self._construct_grid_graph(coordinates)
+        
+        # Add KNN connectivity for additional connections
+        knn_edges = self._construct_knn_graph(coordinates)
+        
+        # Combine edges and remove duplicates
+        all_edges = torch.cat([spatial_edges, knn_edges], dim=1)
+        all_edges = torch.unique(all_edges, dim=1)
+        
+        return all_edges
+
+
+class OSCCGraphDataset:
+    """
+    Dataset class for creating graph representations of OSCC histopathology images
+    """
+    
+    def __init__(self, feature_data, graph_constructor, image_level_labels=None, 
+                 normalize_features=True):
+        """
+        Args:
+            feature_data (dict): Dictionary with 'features', 'labels', 'metadata'
+            graph_constructor (GraphConstructor): Graph construction object
+            image_level_labels (dict): Mapping from image_id to image-level label
+            normalize_features (bool): Whether to normalize node features
+        """
+        self.feature_data = feature_data
+        self.graph_constructor = graph_constructor
+        self.image_level_labels = image_level_labels
+        self.normalize_features = normalize_features
+        
+        # Group patches by image
+        self.image_groups = self._group_patches_by_image()
+        
+        # Normalize features if requested
+        if self.normalize_features:
+            self.scaler = StandardScaler()
+            self.feature_data['features'] = self.scaler.fit_transform(
+                self.feature_data['features']
+            )
+        
+        # Create graph data objects
+        self.graph_data_list = self._create_graph_data_objects()
+    
+    def _group_patches_by_image(self):
+        """
+        Group patches by their source image
+        
+        Returns:
+            dict: Dictionary mapping image_id to patch indices
+        """
+        image_groups = {}
+        
+        for idx, metadata in enumerate(self.feature_data['metadata']):
+            image_id = metadata['image_id']
+            if image_id not in image_groups:
+                image_groups[image_id] = []
+            image_groups[image_id].append(idx)
+        
+        print(f"Grouped {len(self.feature_data['features'])} patches into {len(image_groups)} images")
+        
+        return image_groups
+    
+    def _create_graph_data_objects(self):
+        """
+        Create PyTorch Geometric Data objects for each image
+        
+        Returns:
+            list: List of torch_geometric.data.Data objects
+        """
+        graph_data_list = []
+        
+        print("Creating graph data objects...")
+        
+        for image_id, patch_indices in tqdm(self.image_groups.items()):
+            # Get features and coordinates for this image
+            features = self.feature_data['features'][patch_indices]
+            coordinates = [self.feature_data['metadata'][idx]['coordinates'] 
+                          for idx in patch_indices]
+            
+            # Construct spatial graph
+            edge_index = self.graph_constructor.construct_spatial_graph(coordinates)
+            
+            # Get image-level label
+            if self.image_level_labels is not None:
+                image_label = self.image_level_labels.get(image_id, 0)
+            else:
+                # Use majority vote from patch labels
+                patch_labels = [self.feature_data['labels'][idx] for idx in patch_indices]
+                image_label = max(set(patch_labels), key=patch_labels.count)
+            
+            # Create PyTorch Geometric Data object
+            data = Data(
+                x=torch.tensor(features, dtype=torch.float),
+                edge_index=edge_index,
+                y=torch.tensor(image_label, dtype=torch.long),
+                num_nodes=len(features),
+                image_id=image_id,
+                coordinates=coordinates
+            )
+            
+            graph_data_list.append(data)
+        
+        print(f"Created {len(graph_data_list)} graph data objects")
+        
+        return graph_data_list
+    
+    def __len__(self):
+        return len(self.graph_data_list)
+    
+    def __getitem__(self, idx):
+        return self.graph_data_list[idx]
+    
+    def get_data_statistics(self):
+        """
+        Get statistics about the graph dataset
+        
+        Returns:
+            dict: Dataset statistics
+        """
+        if not self.graph_data_list:
+            return {}
+        
+        num_nodes = [data.num_nodes for data in self.graph_data_list]
+        num_edges = [data.edge_index.size(1) for data in self.graph_data_list]
+        labels = [data.y.item() for data in self.graph_data_list]
+        
+        stats = {
+            'num_graphs': len(self.graph_data_list),
+            'num_features': self.graph_data_list[0].x.size(1),
+            'num_classes': len(set(labels)),
+            'avg_nodes_per_graph': np.mean(num_nodes),
+            'std_nodes_per_graph': np.std(num_nodes),
+            'avg_edges_per_graph': np.mean(num_edges),
+            'std_edges_per_graph': np.std(num_edges),
+            'class_distribution': {i: labels.count(i) for i in set(labels)}
+        }
+        
+        return stats
+
+
+def create_graph_dataloaders(graph_dataset, train_indices, val_indices, test_indices,
+                           batch_size=32, num_workers=4):
+    """
+    Create DataLoaders for graph data with proper batching
+    
+    Args:
+        graph_dataset (OSCCGraphDataset): Graph dataset
+        train_indices (list): Training indices
+        val_indices (list): Validation indices  
+        test_indices (list): Test indices
+        batch_size (int): Batch size
+        num_workers (int): Number of workers for data loading
+        
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    from torch.utils.data import Subset
+    
+    # Create subsets
+    train_dataset = Subset(graph_dataset, train_indices)
+    val_dataset = Subset(graph_dataset, val_indices)
+    test_dataset = Subset(graph_dataset, test_indices)
+    
+    # Create DataLoaders with PyTorch Geometric's DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, 
+                             shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, 
+                           shuffle=False, num_workers=num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, 
+                            shuffle=False, num_workers=num_workers)
+    
+    return train_loader, val_loader, test_loader
+
+
+def visualize_graph_structure(data, save_path=None, max_nodes=100):
+    """
+    Visualize the graph structure for a single image
+    
+    Args:
+        data (torch_geometric.data.Data): Graph data object
+        save_path (str): Path to save visualization
+        max_nodes (int): Maximum number of nodes to visualize
+    """
+    if data.num_nodes > max_nodes:
+        print(f"Too many nodes ({data.num_nodes}), sampling {max_nodes} for visualization")
+        # Sample nodes for visualization
+        selected_nodes = np.random.choice(data.num_nodes, max_nodes, replace=False)
+        # Create subgraph (this is simplified - proper subgraph extraction is more complex)
+        node_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        node_mask[selected_nodes] = True
+        edge_mask = node_mask[data.edge_index[0]] & node_mask[data.edge_index[1]]
+        edge_index = data.edge_index[:, edge_mask]
+        # Remap node indices
+        node_mapping = {old_idx.item(): new_idx for new_idx, old_idx in enumerate(selected_nodes)}
+        edge_index = torch.tensor([[node_mapping[edge_index[0, i].item()], 
+                                   node_mapping[edge_index[1, i].item()]] 
+                                  for i in range(edge_index.size(1))]).t()
+        coordinates = [data.coordinates[i] for i in selected_nodes]
+    else:
+        edge_index = data.edge_index
+        coordinates = data.coordinates
+    
+    # Create NetworkX graph
+    G = nx.Graph()
+    G.add_edges_from(edge_index.t().numpy())
+    
+    # Use spatial coordinates for node positions
+    pos = {i: (coord[1], -coord[0]) for i, coord in enumerate(coordinates)}  # (col, -row)
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Draw graph
+    nx.draw(G, pos, node_size=50, node_color='lightblue', 
+            edge_color='gray', alpha=0.7, width=0.5)
+    
+    plt.title(f"Graph Structure (Image ID: {data.image_id}, Label: {data.y.item()})\n"
+              f"Nodes: {len(coordinates)}, Edges: {edge_index.size(1)}")
+    plt.axis('equal')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Graph visualization saved to {save_path}")
+    
+    plt.show()
+
+
+def save_graph_dataset(graph_dataset, save_path):
+    """
+    Save graph dataset to disk
+    
+    Args:
+        graph_dataset (OSCCGraphDataset): Graph dataset to save
+        save_path (str): Path to save dataset
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    save_data = {
+        'graph_data_list': graph_dataset.graph_data_list,
+        'image_groups': graph_dataset.image_groups,
+        'scaler': getattr(graph_dataset, 'scaler', None),
+        'graph_constructor_params': {
+            'patch_size': graph_dataset.graph_constructor.patch_size,
+            'connectivity': graph_dataset.graph_constructor.connectivity,
+            'k_neighbors': graph_dataset.graph_constructor.k_neighbors,
+            'distance_threshold': graph_dataset.graph_constructor.distance_threshold,
+            'add_self_loops': graph_dataset.graph_constructor.add_self_loops
+        }
+    }
+    
+    with open(save_path, 'wb') as f:
+        pickle.dump(save_data, f)
+    
+    print(f"Graph dataset saved to {save_path}")
+
+
+def load_graph_dataset(load_path):
+    """
+    Load graph dataset from disk
+    
+    Args:
+        load_path (str): Path to load dataset from
+        
+    Returns:
+        OSCCGraphDataset: Loaded graph dataset
+    """
+    with open(load_path, 'rb') as f:
+        save_data = pickle.load(f)
+    
+    # Recreate graph constructor
+    graph_constructor = GraphConstructor(**save_data['graph_constructor_params'])
+    
+    # Create dummy dataset object
+    dataset = OSCCGraphDataset(
+        feature_data={'features': [], 'labels': [], 'metadata': []},
+        graph_constructor=graph_constructor,
+        normalize_features=False
+    )
+    
+    # Override with loaded data
+    dataset.graph_data_list = save_data['graph_data_list']
+    dataset.image_groups = save_data['image_groups']
+    if save_data.get('scaler'):
+        dataset.scaler = save_data['scaler']
+    
+    return dataset
+
+
+if __name__ == "__main__":
+    print("Phase 2: Graph Construction implemented successfully!")
+    print("\nKey components:")
+    print("1. ✓ GraphConstructor with multiple connectivity types")
+    print("2. ✓ Spatial adjacency graph construction")
+    print("3. ✓ K-nearest neighbors graph construction")
+    print("4. ✓ OSCCGraphDataset for PyTorch Geometric")
+    print("5. ✓ Graph visualization utilities")
+    print("6. ✓ DataLoader creation for graph batching")
+    
+    print("\nSupported graph construction methods:")
+    print("  - Grid-based spatial adjacency")
+    print("  - K-nearest neighbors")
+    print("  - Radius-based connectivity")
+    print("  - Hybrid approach")
+
+"""
+Phase 3: Graph Neural Network Design & Training
+===============================================
+
+This module implements the GNN architecture using Graph Attention Networks (GAT)
+for OSCC classification with spatial context modeling.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv, GCNConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import BatchNorm, LayerNorm
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import os
+from pathlib import Path
+
+
+class GATClassifier(nn.Module):
+    """
+    Graph Attention Network for OSCC classification
+    """
+    
+    def __init__(self, input_dim, hidden_dim=64, num_heads=4, num_layers=3, 
+                 num_classes=2, dropout=0.3, use_batch_norm=True):
+        """
+        Args:
+            input_dim (int): Input feature dimension
+            hidden_dim (int): Hidden layer dimension
+            num_heads (int): Number of attention heads
+            num_layers (int): Number of GAT layers
+            num_classes (int): Number of output classes
+            dropout (float): Dropout rate
+            use_batch_norm (bool): Whether to use batch normalization
+        """
+        super(GATClassifier, self).__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.dropout = dropout
+        self.use_batch_norm = use_batch_norm
+        
+        # GAT layers
+        self.gat_layers = nn.ModuleList()
+        self.batch_norms = nn.ModuleList() if use_batch_norm else None
+        
+        # First layer
+        self.gat_layers.append(
+            GATConv(input_dim, hidden_dim, heads=num_heads, dropout=dropout, concat=True)
+        )
+        if use_batch_norm:
+            self.batch_norms.append(BatchNorm(hidden_dim * num_heads))
+        
+        # Hidden layers
+        for _ in range(num_layers - 2):
+            self.gat_layers.append(
+                GATConv(hidden_dim * num_heads, hidden_dim, heads=num_heads, 
+                       dropout=dropout, concat=True)
+            )
+            if use_batch_norm:
+                self.batch_norms.append(BatchNorm(hidden_dim * num_heads))
+        
+        # Final layer (average heads)
+        self.gat_layers.append(
+            GATConv(hidden_dim * num_heads, hidden_dim, heads=num_heads, 
+                   dropout=dropout, concat=False)
+        )
+        if use_batch_norm:
+            self.batch_norms.append(BatchNorm(hidden_dim))
+        
+        # Global pooling and classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+        
+        print(f"GATClassifier initialized: {num_layers} layers, {num_heads} heads, "
+              f"{hidden_dim} hidden dim")
+    
+    def forward(self, x, edge_index, batch):
+        """
+        Forward pass
+        
+        Args:
+            x (torch.Tensor): Node features (N, input_dim)
+            edge_index (torch.Tensor): Edge indices (2, E)
+            batch (torch.Tensor): Batch vector (N,)
+            
+        Returns:
+            torch.Tensor: Class logits (batch_size, num_classes)
+            torch.Tensor: Attention weights for interpretability
+        """
+        attention_weights = []
+        
+        # Apply GAT layers
+        for i, gat_layer in enumerate(self.gat_layers):
+            x, att_weights = gat_layer(x, edge_index, return_attention_weights=True)
+            attention_weights.append(att_weights)
+            
+            # Apply batch normalization
+            if self.use_batch_norm and i < len(self.batch_norms):
+                x = self.batch_norms[i](x)
+            
+            # Apply activation (except for last layer)
+            if i < len(self.gat_layers) - 1:
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Global pooling
+        x = global_mean_pool(x, batch)
+        
+        # Classification
+        logits = self.classifier(x)
+        
+        return logits, attention_weights
+
+
+class GCNClassifier(nn.Module):
+    """
+    Graph Convolutional Network baseline for comparison
+    """
+    
+    def __init__(self, input_dim, hidden_dim=64, num_layers=3, num_classes=2, 
+                 dropout=0.3, use_batch_norm=True):
+        """
+        Args:
+            input_dim (int): Input feature dimension
+            hidden_dim (int): Hidden layer dimension
+            num_layers (int): Number of GCN layers
+            num_classes (int): Number of output classes
+            dropout (float): Dropout rate
+            use_batch_norm (bool): Whether to use batch normalization
+        """
+        super(GCNClassifier, self).__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.dropout = dropout
+        self.use_batch_norm = use_batch_norm
+        
+        # GCN layers
+        self.gcn_layers = nn.ModuleList()
+        self.batch_norms = nn.ModuleList() if use_batch_norm else None
+        
+        # First layer
+        self.gcn_layers.append(GCNConv(input_dim, hidden_dim))
+        if use_batch_norm:
+            self.batch_norms.append(BatchNorm(hidden_dim))
+        
+        # Hidden layers
+        for _ in range(num_layers - 2):
+            self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+            if use_batch_norm:
+                self.batch_norms.append(BatchNorm(hidden_dim))
+        
+        # Final layer
+        self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+        if use_batch_norm:
+            self.batch_norms.append(BatchNorm(hidden_dim))
+        
+        # Global pooling and classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+        
+        print(f"GCNClassifier initialized: {num_layers} layers, {hidden_dim} hidden dim")
+    
+    def forward(self, x, edge_index, batch):
+        """
+        Forward pass
+        
+        Args:
+            x (torch.Tensor): Node features (N, input_dim)
+            edge_index (torch.Tensor): Edge indices (2, E)
+            batch (torch.Tensor): Batch vector (N,)
+            
+        Returns:
+            torch.Tensor: Class logits (batch_size, num_classes)
+        """
+        # Apply GCN layers
+        for i, gcn_layer in enumerate(self.gcn_layers):
+            x = gcn_layer(x, edge_index)
+            
+            # Apply batch normalization
+            if self.use_batch_norm and i < len(self.batch_norms):
+                x = self.batch_norms[i](x)
+            
+            # Apply activation (except for last layer)
+            if i < len(self.gcn_layers) - 1:
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Global pooling
+        x = global_mean_pool(x, batch)
+        
+        # Classification
+        logits = self.classifier(x)
+        
+        return logits
+
+
+class CNNOnlyBaseline(nn.Module):
+    """
+    CNN-only baseline that simply averages patch features
+    """
+    
+    def __init__(self, input_dim, hidden_dim=64, num_classes=2, dropout=0.3):
+        """
+        Args:
+            input_dim (int): Input feature dimension
+            hidden_dim (int): Hidden layer dimension
+            num_classes (int): Number of output classes
+            dropout (float): Dropout rate
+        """
+        super(CNNOnlyBaseline, self).__init__()
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        
+        print(f"CNN-only baseline initialized: {input_dim} -> {num_classes}")
+    
+    def forward(self, x, edge_index, batch):
+        """
+        Forward pass - ignores graph structure
+        
+        Args:
+            x (torch.Tensor): Node features (N, input_dim)
+            edge_index (torch.Tensor): Edge indices (ignored)
+            batch (torch.Tensor): Batch vector (N,)
+            
+        Returns:
+            torch.Tensor: Class logits (batch_size, num_classes)
+        """
+        # Global pooling (average patch features per image)
+        x = global_mean_pool(x, batch)
+        
+        # Classification
+        logits = self.classifier(x)
+        
+        return logits
+
+
+def train_gnn_model(model, train_loader, val_loader, device, num_epochs=100,
+                   learning_rate=1e-4, weight_decay=1e-4, save_path=None):
+    """
+    Train GNN model with comprehensive logging
+    
+    Args:
+        model (nn.Module): GNN model to train
+        train_loader (DataLoader): Training data loader
+        val_loader (DataLoader): Validation data loader
+        device (torch.device): Device for training
+        num_epochs (int): Number of training epochs
+        learning_rate (float): Initial learning rate
+        weight_decay (float): Weight decay for regularization
+        save_path (str): Path to save best model
+        
+    Returns:
+        dict: Training history
+    """
+    model.to(device)
+    
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
+    # Training history
+    history = {
+        'train_loss': [], 'train_acc': [], 'train_f1': [],
+        'val_loss': [], 'val_acc': [], 'val_f1': []
+    }
+    
+    best_val_f1 = 0.0
+    best_model_state = None
+    
+    print(f"Training GNN model for {num_epochs} epochs...")
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_preds = []
+        train_labels = []
+        
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
+            batch = batch.to(device)
+            
+            optimizer.zero_grad()
+            
+            if isinstance(model, GATClassifier):
+                logits, _ = model(batch.x, batch.edge_index, batch.batch)
+            else:
+                logits = model(batch.x, batch.edge_index, batch.batch)
+            
+            loss = criterion(logits, batch.y)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+            train_labels.extend(batch.y.cpu().numpy())
+        
+        train_loss = train_loss / len(train_loader)
+        train_acc = accuracy_score(train_labels, train_preds)
+        train_f1 = precision_recall_fscore_support(train_labels, train_preds, average='weighted')[2]
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_preds = []
+        val_labels = []
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                batch = batch.to(device)
+                
+                if isinstance(model, GATClassifier):
+                    logits, _ = model(batch.x, batch.edge_index, batch.batch)
+                else:
+                    logits = model(batch.x, batch.edge_index, batch.batch)
+                
+                loss = criterion(logits, batch.y)
+                
+                val_loss += loss.item()
+                val_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                val_labels.extend(batch.y.cpu().numpy())
+        
+        val_loss = val_loss / len(val_loader)
+        val_acc = accuracy_score(val_labels, val_preds)
+        val_f1 = precision_recall_fscore_support(val_labels, val_preds, average='weighted')[2]
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Save history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['train_f1'].append(train_f1)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
+        
+        # Save best model based on F1 score
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_model_state = model.state_dict().copy()
+        
+        print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Train F1: {train_f1:.4f}")
+        print(f"           Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}")
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\nBest validation F1 score: {best_val_f1:.4f}")
+    
+    # Save model if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'model_config': {
+                'input_dim': getattr(model, 'input_dim', None),
+                'hidden_dim': getattr(model, 'hidden_dim', None),
+                'num_heads': getattr(model, 'num_heads', None),
+                'num_layers': getattr(model, 'num_layers', None),
+                'num_classes': getattr(model, 'num_classes', None),
+                'dropout': getattr(model, 'dropout', None)
+            },
+            'history': history,
+            'best_val_f1': best_val_f1
+        }, save_path)
+        print(f"Best model saved to {save_path}")
+    
+    return history
+
+
+def evaluate_model(model, test_loader, device, class_names=['Normal', 'OSCC']):
+    """
+    Comprehensive evaluation of trained model
+    
+    Args:
+        model (nn.Module): Trained model
+        test_loader (DataLoader): Test data loader
+        device (torch.device): Device for evaluation
+        class_names (list): Names of classes for reporting
+        
+    Returns:
+        dict: Evaluation results
+    """
+    model.eval()
+    model.to(device)
+    
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    
+    print("Evaluating model on test set...")
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader):
+            batch = batch.to(device)
+            
+            if isinstance(model, GATClassifier):
+                logits, _ = model(batch.x, batch.edge_index, batch.batch)
+            else:
+                logits = model(batch.x, batch.edge_index, batch.batch)
+            
+            probs = F.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch.y.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+    
+    all_probs = np.array(all_probs)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='weighted')
+    auc = roc_auc_score(all_labels, all_probs[:, 1])
+    
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    # Classification report
+    report = classification_report(all_labels, all_preds, target_names=class_names)
+    
+    results = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc,
+        'confusion_matrix': cm,
+        'classification_report': report,
+        'predictions': all_preds,
+        'labels': all_labels,
+        'probabilities': all_probs
+    }
+    
+    print(f"\nTest Results:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"AUC-ROC: {auc:.4f}")
+    print(f"\nClassification Report:")
+    print(report)
+    
+    return results
+
+
+def plot_confusion_matrix(cm, class_names, save_path=None):
+    """
+    Plot confusion matrix
+    
+    Args:
+        cm (np.array): Confusion matrix
+        class_names (list): Class names
+        save_path (str): Path to save plot
+    """
+    plt.figure(figsize=(8, 6))
+    
+    # Normalize confusion matrix
+    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    
+    sns.heatmap(cm_norm, annot=True, fmt='.3f', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    
+    plt.title('Normalized Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Confusion matrix saved to {save_path}")
+    
+    plt.show()
+
+
+def plot_training_curves(history, save_path=None):
+    """
+    Plot training curves
+    
+    Args:
+        history (dict): Training history
+        save_path (str): Path to save plot
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # Loss
+    axes[0].plot(epochs, history['train_loss'], 'b-', label='Training Loss')
+    axes[0].plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
+    axes[0].set_title('Training and Validation Loss')
+    axes[0].set_xlabel('Epochs')
+    axes[0].set_ylabel('Loss')
+    axes[0].legend()
+    axes[0].grid(True)
+    
+    # Accuracy
+    axes[1].plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
+    axes[1].plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
+    axes[1].set_title('Training and Validation Accuracy')
+    axes[1].set_xlabel('Epochs')
+    axes[1].set_ylabel('Accuracy')
+    axes[1].legend()
+    axes[1].grid(True)
+    
+    # F1 Score
+    axes[2].plot(epochs, history['train_f1'], 'b-', label='Training F1')
+    axes[2].plot(epochs, history['val_f1'], 'r-', label='Validation F1')
+    axes[2].set_title('Training and Validation F1 Score')
+    axes[2].set_xlabel('Epochs')
+    axes[2].set_ylabel('F1 Score')
+    axes[2].legend()
+    axes[2].grid(True)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Training curves saved to {save_path}")
+    
+    plt.show()
+
+
+def load_model(model_path, model_class, device):
+    """
+    Load trained model from checkpoint
+    
+    Args:
+        model_path (str): Path to model checkpoint
+        model_class (class): Model class to instantiate
+        device (torch.device): Device to load model on
+        
+    Returns:
+        nn.Module: Loaded model
+        dict: Model configuration and history
+    """
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Get model configuration
+    config = checkpoint['model_config']
+    
+    # Instantiate model
+    model = model_class(**{k: v for k, v in config.items() if v is not None})
+    
+    # Load state dict
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    
+    print(f"Model loaded from {model_path}")
+    print(f"Best validation F1: {checkpoint.get('best_val_f1', 'N/A')}")
+    
+    return model, checkpoint
+
+
+if __name__ == "__main__":
+    print("Phase 3: GNN Design & Training implemented successfully!")
+    print("\nKey components:")
+    print("1. ✓ GATClassifier with attention mechanism")
+    print("2. ✓ GCNClassifier for comparison") 
+    print("3. ✓ CNN-only baseline")
+    print("4. ✓ Comprehensive training pipeline")
+    print("5. ✓ Evaluation metrics and visualization")
+    print("6. ✓ Model saving and loading")
+    
+    print("\nModel architectures available:")
+    print("  - GAT: Graph Attention Network (main approach)")
+    print("  - GCN: Graph Convolutional Network (comparison)")
+    print("  - CNN-only: Baseline without graph structure")
+
+"""
+Phase 4: Advanced Evaluation, Interpretation & Ablation Studies
+===============================================================
+
+This module implements comprehensive evaluation metrics, attention visualization 
+for interpretability, and ablation studies for model analysis.
+"""
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import confusion_matrix, roc_curve, precision_recall_curve
+import cv2
+from pathlib import Path
+import pandas as pd
+from tqdm import tqdm
+import os
+
+
+class AttentionVisualizer:
+    """
+    Visualize attention weights for GAT model interpretability
+    """
+    
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self.model.eval()
+        self.model.to(device)
+    
+    def extract_attention_weights(self, data):
+        data = data.to(self.device)
+        with torch.no_grad():
+            logits, attention_weights = self.model(data.x, data.edge_index, 
+                                                  torch.zeros(data.num_nodes, dtype=torch.long).to(self.device))
+        prediction = torch.argmax(logits, dim=1).item()
+        return attention_weights, prediction
+    
+    def create_attention_heatmap(self, data, patch_size=256, image_shape=None, 
+                               layer_idx=-1, save_path=None):
+        attention_weights, prediction = self.extract_attention_weights(data)
+        edge_index, att_weights = attention_weights[layer_idx]
+        node_attention = torch.zeros(data.num_nodes, device=self.device)
+        for i, (_, dst) in enumerate(edge_index.t()):
+            node_attention[dst] += att_weights[i].mean()
+        node_attention = node_attention.cpu().numpy()
+        node_attention = node_attention / node_attention.max() if node_attention.max() > 0 else node_attention
+        if image_shape is None:
+            coords = np.array(data.coordinates)
+            image_shape = (coords[:, 0].max() + patch_size, coords[:, 1].max() + patch_size)
+        heatmap = np.zeros(image_shape)
+        for i, (row, col) in enumerate(data.coordinates):
+            heatmap[row:row+patch_size, col:col+patch_size] = node_attention[i]
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.imshow(heatmap, cmap='Reds')
+        plt.title(f'Attention Heatmap (Pred: {"OSCC" if prediction==1 else "Normal"})')
+        plt.axis('off')
+        plt.subplot(1, 2, 2)
+        plt.hist(node_attention, bins=20, color='red', alpha=0.7)
+        plt.title('Attention Distribution')
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        return heatmap
+
+
+class ModelEvaluator:
+    def __init__(self, class_names=['Normal', 'OSCC']):
+        self.class_names = class_names
+    
+    def evaluate_comprehensive(self, model, test_loader, device):
+        model.eval(); model.to(device)
+        all_preds, all_labels, all_probs = [], [], []
+        with torch.no_grad():
+            for batch in tqdm(test_loader):
+                batch = batch.to(device)
+                logits = model(batch.x, batch.edge_index, batch.batch)[0] if hasattr(model, 'num_heads') else model(batch.x, batch.edge_index, batch.batch)
+                probs = F.softmax(logits, dim=1)
+                preds = torch.argmax(logits, dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(batch.y.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+        all_probs = np.array(all_probs)
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='weighted')
+        auc_roc = roc_auc_score(all_labels, all_probs[:, 1])
+        cm = confusion_matrix(all_labels, all_preds)
+        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+        prec_curve, rec_curve, _ = precision_recall_curve(all_labels, all_probs[:, 1])
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'auc_roc': auc_roc,
+            'confusion_matrix': cm,
+            'fpr': fpr,
+            'tpr': tpr,
+            'precision_curve': prec_curve,
+            'recall_curve': rec_curve
+        }
+
+
+class AblationStudy:
+    def __init__(self, device):
+        self.device = device
+        self.results = {}
+    
+    def run_ablation_study(self, train_loader, val_loader, test_loader, input_dim, num_epochs=20):
+        from phase3_gnn_training import GATClassifier, GCNClassifier, CNNOnlyBaseline, train_gnn_model
+        configs = {
+            'GAT_Full': GATClassifier(input_dim, 64, 4, 3, 2, 0.3, True),
+            'GCN_Baseline': GCNClassifier(input_dim, 64, 3, 2, 0.3, True),
+            'CNN_Only': CNNOnlyBaseline(input_dim, 64, 2, 0.3)
+        }
+        from phase3_gnn_training import evaluate_model
+        for name, model in configs.items():
+            history = train_gnn_model(model, train_loader, val_loader, self.device, num_epochs=num_epochs)
+            results = evaluate_model(model, test_loader, self.device)
+            self.results[name] = {'history': history, 'results': results}
+            print(f"{name}: F1 = {results['f1']:.4f}, AUC = {results['auc']:.4f}")
+        return self.results
+
+
+if __name__ == "__main__":
+    print("Phase 4: Evaluation & Interpretation implemented successfully!")
+    print("Key components:")
+    print("- AttentionVisualizer")
+    print("- ModelEvaluator")
+    print("- AblationStudy framework")
